@@ -22,6 +22,38 @@ from .train import exclusive_labels_to_regions, split_train_val
 logger = logging.getLogger(__name__)
 
 
+# Input order of checkpoints trained before T1c was dropped (commit 9845744).
+LEGACY_4CH_MODALITIES: tuple[str, ...] = ("flair", "t1", "t1c", "t2")
+
+
+def _adapt_input_conv(key: str, tensor: torch.Tensor, target: torch.Tensor | None):
+    """
+    Map a legacy 4-channel first conv (FLAIR, T1, T1c, T2) onto the current
+    3-channel input (FLAIR, T1, T2) by keeping the matching input slices.
+
+    The kept kernels are exactly the ones the network learned for those
+    sequences; only the T1c pathway is dropped. Returns ``None`` for any other
+    kind of mismatch.
+    """
+    from .model import IN_MODALITIES
+
+    if target is None or tensor.ndim != 5 or target.ndim != 5:
+        return None
+    if tensor.shape[0] != target.shape[0] or tensor.shape[2:] != target.shape[2:]:
+        return None
+    if tensor.shape[1] != len(LEGACY_4CH_MODALITIES) or target.shape[1] != len(IN_MODALITIES):
+        return None
+    idx = [LEGACY_4CH_MODALITIES.index(m) for m in IN_MODALITIES]
+    logger.warning(
+        "%s: adapting legacy 4-channel weights → %s (dropping T1c). "
+        "Enhancing-tumor (ET/TC) accuracy will be lower than a model trained "
+        "on 3 channels.",
+        key,
+        list(IN_MODALITIES),
+    )
+    return tensor[:, idx].clone()
+
+
 def load_model_from_checkpoint(
     checkpoint: str | Path,
     *,
@@ -30,10 +62,10 @@ def load_model_from_checkpoint(
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     """Load model weights from a training checkpoint (``best_model.pt``).
 
-    Skips any tensors whose shape no longer matches the current model
-    (e.g. ``convInit`` when the input-channel count changed, such as after
-    dropping T1c) rather than failing outright, so the rest of the
-    pretrained weights still transfer.
+    Legacy 4-channel checkpoints (FLAIR, T1, T1c, T2) are adapted to the
+    current 3-channel input by keeping the FLAIR/T1/T2 slices of the first
+    conv. Any other shape mismatch raises — a partly random network gives
+    meaningless segmentations.
     """
     checkpoint = Path(checkpoint)
     if not checkpoint.is_file():
@@ -53,16 +85,24 @@ def load_model_from_checkpoint(
     for key, tensor in state.items():
         if key in model_sd and model_sd[key].shape == tensor.shape:
             compatible[key] = tensor
+            continue
+        adapted = _adapt_input_conv(key, tensor, model_sd.get(key))
+        if adapted is not None:
+            compatible[key] = adapted
         else:
             skipped.append(key)
 
-    missing, unexpected = model.load_state_dict(compatible, strict=False)
     if skipped:
-        logger.warning(
-            "Skipped %d mismatched checkpoint tensors (will train fresh): %s",
-            len(skipped),
-            skipped,
+        # A randomly initialised layer makes every prediction meaningless, so
+        # refuse instead of silently running a half-loaded model.
+        raise RuntimeError(
+            f"Checkpoint {checkpoint.name} does not fit the current model; "
+            f"{len(skipped)} tensors could not be loaded: {skipped[:5]}. "
+            "Retrain, or use a checkpoint built for the current input channels."
         )
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
+    if missing:
+        raise RuntimeError(f"Model weights missing from checkpoint: {missing[:5]}")
     model.to(device)
     model.eval()
     logger.info(
