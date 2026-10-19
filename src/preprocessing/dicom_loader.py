@@ -50,7 +50,7 @@ _T2_RE = re.compile(
 
 # Standalone contrast-agent name hints (with ContrastBolusAgent → promote T1 → T1c).
 _CONTRAST_HINT_RE = re.compile(
-    r"(?:^|[^a-z0-9])(?:post|\+c|c\+|gd|gado|gadolinium|contrast)(?:[^a-z0-9]|$)",
+    r"(?:^|[^a-z0-9])(?:post|\+c|c\+|gd|gado|gadolinium|contrast|ce)(?:[^a-z0-9]|$)",
     re.I,
 )
 
@@ -83,7 +83,12 @@ class SeriesMeta:
     contrast_evidence: list[str] = field(default_factory=list)
 
     def to_json_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        # PATCH(privacy): never write patient identifiers or source DICOM paths to disk
+        d = asdict(self)
+        d.pop("patient_id", None)
+        d.pop("dicom_files", None)
+        d["n_dicom_files"] = self.num_instances
+        return d
 
 
 def series_text(*parts: str | None) -> str:
@@ -513,8 +518,7 @@ def load_dicom_study(
     first_ds = first_members[0][1]
     if study_id is None:
         study_id = (
-            _safe_str(first_ds, "PatientID")
-            or _safe_str(first_ds, "StudyID")
+            _safe_str(first_ds, "StudyID")
             or _safe_slug(_safe_str(first_ds, "StudyInstanceUID"), "study")
         )
     study_id = _safe_slug(study_id, "study")
