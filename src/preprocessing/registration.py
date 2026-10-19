@@ -50,13 +50,21 @@ def register_to_reference(
     transform_output: str | Path | None = None,
     number_of_iterations: int = 200,
     sampling_percentage: float = 0.25,
+    mode: Literal["guarded", "header", "registered"] = "guarded",
+    seed: int = 42,
+    min_gain: float = 0.005,
+    max_shift_mm: float = 10.0,
 ) -> Path:
     """
-    Register ``moving`` to ``fixed`` with SimpleITK (rigid by default).
-
-    Writes the resampled moving image in the fixed image's grid. Optionally
-    saves the transform as ``.tfm``.
+    PATCH(guarded registration): series from one scanner session are already aligned by their
+    DICOM geometry. A seeded rigid Mattes-MI registration is computed, but in ``guarded`` mode it
+    is applied only if it raises brain overlap (Dice of nonzero voxels) with the fixed image by
+    >= ``min_gain`` and moves the brain <= ``max_shift_mm``; otherwise the header (identity)
+    alignment is kept. The decision is written next to the transform as ``<transform>.qc.json``.
     """
+    import json as _json
+    import numpy as np
+
     moving_nifti = Path(moving_nifti)
     fixed_nifti = Path(fixed_nifti)
     output_nifti = Path(output_nifti)
@@ -64,61 +72,71 @@ def register_to_reference(
 
     fixed = sitk.Cast(sitk.ReadImage(str(fixed_nifti)), sitk.sitkFloat32)
     moving = sitk.Cast(sitk.ReadImage(str(moving_nifti)), sitk.sitkFloat32)
+    fixed_mask = sitk.Cast(fixed != 0, sitk.sitkUInt8)
+    moving_mask = sitk.Cast(moving != 0, sitk.sitkUInt8)
 
-    if transform_type == "rigid":
-        initial_tx = sitk.Euler3DTransform()
-    else:
-        initial_tx = sitk.AffineTransform(3)
+    def overlap(tx):
+        warped = sitk.Resample(moving_mask, fixed, tx, sitk.sitkNearestNeighbor, 0, sitk.sitkUInt8)
+        a = sitk.GetArrayViewFromImage(fixed_mask) > 0
+        b = sitk.GetArrayViewFromImage(warped) > 0
+        s = int(a.sum()) + int(b.sum())
+        return float(2.0 * np.logical_and(a, b).sum() / s) if s else 0.0
 
-    initial = sitk.CenteredTransformInitializer(
-        fixed,
-        moving,
-        initial_tx,
-        sitk.CenteredTransformInitializerFilter.GEOMETRY,
-    )
+    stats = sitk.LabelShapeStatisticsImageFilter()
+    stats.Execute(fixed_mask)
+    centre = (stats.GetCentroid(1) if stats.HasLabel(1)
+              else fixed.TransformContinuousIndexToPhysicalPoint([(s - 1) / 2 for s in fixed.GetSize()]))
 
-    registration = sitk.ImageRegistrationMethod()
-    registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
-    registration.SetMetricSamplingStrategy(registration.RANDOM)
-    registration.SetMetricSamplingPercentage(sampling_percentage)
-    registration.SetInterpolator(sitk.sitkLinear)
-    registration.SetOptimizerAsGradientDescent(
-        learningRate=1.0,
-        numberOfIterations=number_of_iterations,
-        convergenceMinimumValue=1e-6,
-        convergenceWindowSize=10,
-    )
-    registration.SetOptimizerScalesFromPhysicalShift()
-    registration.SetInitialTransform(initial, inPlace=False)
-    registration.SetShrinkFactorsPerLevel([4, 2, 1])
-    registration.SetSmoothingSigmasPerLevel([2, 1, 0])
-    registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+    header_tx = sitk.Euler3DTransform()
+    chosen = header_tx
+    qc = {"mode": mode, "dice_header": overlap(header_tx), "dice_registered": None,
+          "shift_mm_registered": None, "chosen": "header", "metric": None, "stop": None, "error": None,
+          "min_gain": min_gain, "max_shift_mm": max_shift_mm, "seed": seed}
 
-    transform = registration.Execute(fixed, moving)
-    logger.info(
-        "Registered %s → %s (%s), metric=%.6f, stop=%s",
-        moving_nifti.name,
-        fixed_nifti.name,
-        transform_type,
-        registration.GetMetricValue(),
-        registration.GetOptimizerStopConditionDescription(),
-    )
+    if mode != "header":
+        try:
+            initial_tx = sitk.Euler3DTransform() if transform_type == "rigid" else sitk.AffineTransform(3)
+            initial = sitk.CenteredTransformInitializer(
+                fixed, moving, initial_tx, sitk.CenteredTransformInitializerFilter.GEOMETRY)
+            registration = sitk.ImageRegistrationMethod()
+            registration.SetMetricAsMattesMutualInformation(numberOfHistogramBins=50)
+            registration.SetMetricSamplingStrategy(registration.RANDOM)
+            registration.SetMetricSamplingPercentage(sampling_percentage, seed)
+            registration.SetInterpolator(sitk.sitkLinear)
+            registration.SetOptimizerAsGradientDescent(
+                learningRate=1.0, numberOfIterations=number_of_iterations,
+                convergenceMinimumValue=1e-6, convergenceWindowSize=10)
+            registration.SetOptimizerScalesFromPhysicalShift()
+            registration.SetInitialTransform(initial, inPlace=False)
+            registration.SetShrinkFactorsPerLevel([4, 2, 1])
+            registration.SetSmoothingSigmasPerLevel([2, 1, 0])
+            registration.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+            reg_tx = registration.Execute(fixed, moving)
+            shift = float(np.linalg.norm(np.subtract(reg_tx.TransformPoint(centre), centre)))
+            qc.update(dice_registered=overlap(reg_tx), shift_mm_registered=shift,
+                      metric=float(registration.GetMetricValue()),
+                      stop=registration.GetOptimizerStopConditionDescription())
+            if mode == "registered" or (qc["dice_registered"] >= qc["dice_header"] + min_gain
+                                        and shift <= max_shift_mm):
+                chosen = reg_tx
+                qc["chosen"] = "registered"
+        except Exception as exc:  # noqa: BLE001 — keep header alignment, record why
+            qc["error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("Registration failed for %s; keeping header alignment (%s)", moving_nifti.name, exc)
 
-    resampled = sitk.Resample(
-        moving,
-        fixed,
-        transform,
-        sitk.sitkLinear,
-        0.0,
-        sitk.sitkFloat32,
-    )
+    resampled = sitk.Resample(moving, fixed, chosen, sitk.sitkLinear, 0.0, sitk.sitkFloat32)
     sitk.WriteImage(resampled, str(output_nifti))
+    logger.info("Aligned %s → %s: chosen=%s dice_header=%.3f dice_registered=%s",
+                moving_nifti.name, fixed_nifti.name, qc["chosen"], qc["dice_header"], qc["dice_registered"])
 
     if transform_output is not None:
         transform_output = Path(transform_output)
         transform_output.parent.mkdir(parents=True, exist_ok=True)
-        sitk.WriteTransform(transform, str(transform_output))
-
+        sitk.WriteTransform(chosen, str(transform_output))
+        qc_path = transform_output.with_name(transform_output.name + ".qc.json")
+    else:
+        qc_path = output_nifti.with_name(output_nifti.name + ".reg_qc.json")
+    qc_path.write_text(_json.dumps(qc, indent=2))
     return output_nifti
 
 
@@ -267,21 +285,63 @@ def register_modalities_to_reference(
     return isotropic
 
 
+# PATCH(axial-first selection): rank by plane, sequence family, slice thickness, then instances.
+import re as _re
+import numpy as _np
+
+_SEL_EXCLUDE_RE = _re.compile(r"mip|survey|surv\b|mobiview|stir|pitu|dyn\b|press|btfe|\bmt\b", _re.I)
+_SEL_PREFERRED = {"t1": (r"t1w_se", r"t1w_ir"), "t2": (r"t2w_tse",), "flair": (r"flair",)}
+
+
+def _series_plane(s: SeriesMeta) -> str | None:
+    iop = s.image_orientation_patient
+    if not iop or len(iop) < 6:
+        return None
+    n = _np.cross(_np.asarray(iop[:3], float), _np.asarray(iop[3:6], float))
+    return ("SAG", "COR", "AX")[int(_np.argmax(_np.abs(n)))]
+
+
 def _pick_best_series(
     series: list[SeriesMeta],
     modality: str,
 ) -> SeriesMeta | None:
-    """Prefer converted series with the most instances for a modality folder."""
+    """Pick one series per modality: axial first, then preferred sequence family,
+    thinner slices, more instances. Excludes localizers/MIPs/spine/pituitary/
+    spectroscopy, T1-weighted FLAIR, and 3D TFE (contrast status unconfirmed)."""
+    def text(s):
+        return " ".join(x for x in (s.series_description, s.protocol_name) if x)
+
+    def excluded(s):
+        t = text(s)
+        if _SEL_EXCLUDE_RE.search(t):
+            return True
+        if modality == "flair" and _re.search(r"t1w?", t, _re.I):
+            return True
+        if modality == "t1" and _re.search(r"3d[_ ]?tfe", t, _re.I):
+            return True
+        return False
+
     candidates = [
-        s
-        for s in series
+        s for s in series
         if s.inferred_mri_contrast == modality
         and s.nifti_path
         and Path(s.nifti_path).is_file()
+        and not excluded(s)
     ]
     if not candidates:
         return None
-    return max(candidates, key=lambda s: s.num_instances)
+
+    def rank(s):
+        t = text(s)
+        pats = _SEL_PREFERRED.get(modality, ())
+        name = next((i for i, p in enumerate(pats) if _re.search(p, t, _re.I)), len(pats))
+        thick = s.slice_thickness if s.slice_thickness else 99.0
+        return (0 if _series_plane(s) == "AX" else 1, name, thick, -(s.num_instances or 0))
+
+    best = min(candidates, key=rank)
+    if _series_plane(best) != "AX":
+        best.notes.append(f"Selected non-axial {modality} series: no axial candidate available")
+    return best
 
 
 def preprocess_nifti_modalities(
